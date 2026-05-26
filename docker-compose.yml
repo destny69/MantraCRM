@@ -11,7 +11,7 @@ services:
       timeout: 3s
       retries: 5
     ports:
-      - "5433:5433"
+      - "5433:5432"
 
   redis:
     image: redis:7-alpine
@@ -21,7 +21,7 @@ services:
       timeout: 3s
       retries: 5
     ports:
-      - "6378:6378"
+      - "6378:6379"
 
   backend:
     build:
