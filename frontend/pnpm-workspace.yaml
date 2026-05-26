@@ -5,3 +5,6 @@ minimumReleaseAgeExclude:
 onlyBuiltDependencies:
   - esbuild
   - '@sentry/cli'
+overrides:
+  'svelte-eslint-parser>eslint-scope': '^9.1.0'
+confirmModulesPurge: false
