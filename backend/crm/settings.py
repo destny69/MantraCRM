@@ -133,6 +133,12 @@ USE_TZ = True
 EMAIL_BACKEND = os.environ.get(
     "EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend"
 )
+EMAIL_HOST = os.environ.get("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(os.environ.get("EMAIL_PORT", "587"))
+EMAIL_HOST_PASSWORD = os.environ.get("EMAIL_HOST_PASSWORD", "dgldfryzxtxoocvg")
+EMAIL_USE_TLS = os.environ.get("EMAIL_USE_TLS", "True").lower() == "true"
+EMAIL_USE_SSL = os.environ.get("EMAIL_USE_SSL", "False").lower() == "true"
+EMAIL_TIMEOUT = int(os.environ.get("EMAIL_TIMEOUT", "10"))
 
 AUTH_USER_MODEL = "common.User"
 
@@ -147,8 +153,9 @@ if ENV_TYPE == "dev":
 elif ENV_TYPE == "prod":
     from .server_settings import *  # noqa: F401
 
-DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "noreply@localhost")
+DEFAULT_FROM_EMAIL = os.environ.get("DEFAULT_FROM_EMAIL", "agabirdevkota5@gmail.com")
 ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "admin@localhost")
+EMAIL_HOST_USER = os.environ.get("EMAIL_HOST_USER", DEFAULT_FROM_EMAIL)
 
 # AWS SES settings (loaded when EMAIL_BACKEND is django_ses.SESBackend)
 if "django_ses" in EMAIL_BACKEND:

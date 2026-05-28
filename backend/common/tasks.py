@@ -1,19 +1,229 @@
 import logging
+from contextvars import ContextVar
 from datetime import timedelta
+from functools import wraps
+from smtplib import SMTPException
 
 from botocore.exceptions import ClientError
-from celery import shared_task
+from celery import current_task, shared_task
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.mail import EmailMessage
 from django.core.validators import validate_email
-from django.core.exceptions import ValidationError
 from django.db import connection
 from django.template.loader import render_to_string
 from django.utils import timezone
 
-from common.models import Comment, MagicLinkToken, Notification, Profile, Teams, User
+from common.models import (
+    CeleryTaskLog,
+    Comment,
+    MagicLinkToken,
+    Notification,
+    Profile,
+    Teams,
+    User,
+)
 
 logger = logging.getLogger(__name__)
+
+_task_log_ctx = ContextVar("task_log", default=None)
+
+
+def _safe_repr(value, max_len=300):
+    text = repr(value)
+    if len(text) > max_len:
+        return f"{text[:max_len]}..."
+    return text
+
+
+def _sanitize_kwargs(kwargs):
+    redacted_keys = {"password", "token", "raw_code", "code", "secret"}
+    sanitized = {}
+    for key, value in kwargs.items():
+        if any(secret_key in key.lower() for secret_key in redacted_keys):
+            sanitized[key] = "***"
+        else:
+            sanitized[key] = _safe_repr(value, max_len=120)
+    return sanitized
+
+
+def _get_celery_task_id():
+    request = getattr(current_task, "request", None)
+    return getattr(request, "id", "") or ""
+
+
+def _persist_task_log(task_name, args, kwargs):
+    try:
+        return CeleryTaskLog.objects.create(
+            task_name=task_name,
+            celery_task_id=_get_celery_task_id(),
+            status=CeleryTaskLog.Status.STARTED,
+            message="Task execution started",
+            details={
+                "args": [_safe_repr(arg, max_len=120) for arg in args[:5]],
+                "kwargs": _sanitize_kwargs(kwargs),
+            },
+        )
+    except Exception:
+        logger.exception("Failed to create CeleryTaskLog for %s", task_name)
+        return None
+
+
+def _update_task_log(task_log, *, status=None, message=None, details=None):
+    if not task_log:
+        return
+    try:
+        if status:
+            task_log.status = status
+        if message is not None:
+            task_log.message = message
+        if details:
+            merged_details = dict(task_log.details or {})
+            merged_details.update(details)
+            task_log.details = merged_details
+
+        if status in {
+            CeleryTaskLog.Status.SUCCESS,
+            CeleryTaskLog.Status.FAILED,
+            CeleryTaskLog.Status.SKIPPED,
+        }:
+            now = timezone.now()
+            task_log.finished_at = now
+            if task_log.started_at:
+                task_log.duration_ms = int(
+                    (now - task_log.started_at).total_seconds() * 1000
+                )
+
+        task_log.save(
+            update_fields=[
+                "status",
+                "message",
+                "details",
+                "finished_at",
+                "duration_ms",
+                "email_status",
+                "email_sent_count",
+                "email_failed_count",
+            ]
+        )
+        if status:
+            logger.info(
+                "[CeleryTaskLog] task=%s celery_id=%s status=%s message=%s",
+                task_log.task_name,
+                task_log.celery_task_id or "-",
+                status,
+                message or "",
+            )
+    except Exception:
+        logger.exception("Failed to update CeleryTaskLog %s", getattr(task_log, "id", ""))
+
+
+def _mark_task_skipped(reason, details=None):
+    task_log = _task_log_ctx.get()
+    _update_task_log(
+        task_log,
+        status=CeleryTaskLog.Status.SKIPPED,
+        message=reason,
+        details=details or {},
+    )
+
+
+def _record_email_delivery(*, recipient, subject, success, error=None):
+    task_log = _task_log_ctx.get()
+    if not task_log:
+        return
+    try:
+        if success:
+            task_log.email_sent_count += 1
+        else:
+            task_log.email_failed_count += 1
+
+        if task_log.email_sent_count > 0 and task_log.email_failed_count > 0:
+            task_log.email_status = CeleryTaskLog.EmailStatus.PARTIAL
+        elif task_log.email_sent_count > 0:
+            task_log.email_status = CeleryTaskLog.EmailStatus.SENT
+        elif task_log.email_failed_count > 0:
+            task_log.email_status = CeleryTaskLog.EmailStatus.FAILED
+
+        details = dict(task_log.details or {})
+        deliveries = details.get("email_deliveries", [])
+        deliveries.append(
+            {
+                "recipient": recipient,
+                "subject": subject,
+                "status": "SENT" if success else "FAILED",
+                "error": _safe_repr(error, max_len=200) if error else "",
+                "at": timezone.now().isoformat(),
+            }
+        )
+        details["email_deliveries"] = deliveries[-25:]
+        task_log.details = details
+        task_log.save(update_fields=["email_status", "email_sent_count", "email_failed_count", "details"])
+        if success:
+            logger.info(
+                "[CeleryEmail] task=%s to=%s status=SENT subject=%s",
+                task_log.task_name,
+                recipient,
+                subject,
+            )
+        else:
+            logger.warning(
+                "[CeleryEmail] task=%s to=%s status=FAILED subject=%s error=%s",
+                task_log.task_name,
+                recipient,
+                subject,
+                _safe_repr(error, max_len=200),
+            )
+    except Exception:
+        logger.exception("Failed to record email delivery for task log %s", task_log.id)
+
+
+def track_celery_task(task_name):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            task_log = _persist_task_log(task_name, args, kwargs)
+            token = _task_log_ctx.set(task_log)
+            logger.info(
+                "[CeleryTask] STARTED task=%s celery_id=%s",
+                task_name,
+                _get_celery_task_id() or "-",
+            )
+            try:
+                result = func(*args, **kwargs)
+                latest_log = _task_log_ctx.get()
+                if latest_log and latest_log.status == CeleryTaskLog.Status.STARTED:
+                    _update_task_log(
+                        latest_log,
+                        status=CeleryTaskLog.Status.SUCCESS,
+                        message="Task execution completed",
+                    )
+                logger.info(
+                    "[CeleryTask] SUCCESS task=%s celery_id=%s",
+                    task_name,
+                    _get_celery_task_id() or "-",
+                )
+                return result
+            except Exception as exc:
+                _update_task_log(
+                    _task_log_ctx.get(),
+                    status=CeleryTaskLog.Status.FAILED,
+                    message=f"Task execution failed: {exc}",
+                    details={"error_type": exc.__class__.__name__},
+                )
+                logger.exception(
+                    "[CeleryTask] FAILED task=%s celery_id=%s error=%s",
+                    task_name,
+                    _get_celery_task_id() or "-",
+                    exc,
+                )
+                raise
+            finally:
+                _task_log_ctx.reset(token)
+
+        return wrapper
+
+    return decorator
 
 
 def set_rls_context(org_id):
@@ -37,10 +247,12 @@ def set_rls_context(org_id):
 
 
 @shared_task
+@track_celery_task("send_welcome_email")
 def send_welcome_email(user_id):
     """Send welcome email to newly created users."""
     user_obj = User.objects.filter(id=user_id).first()
     if not user_obj:
+        _mark_task_skipped("User not found", {"user_id": str(user_id)})
         return
 
     email = user_obj.email.strip()
@@ -48,6 +260,7 @@ def send_welcome_email(user_id):
         validate_email(email)
     except ValidationError:
         logger.warning("Welcome email skipped: invalid email for user %s", user_id)
+        _mark_task_skipped("Invalid email format", {"user_id": str(user_id), "email": email})
         return
 
     context = {"url": settings.FRONTEND_URL}
@@ -63,11 +276,15 @@ def send_welcome_email(user_id):
     msg.content_subtype = "html"
     try:
         msg.send()
-    except ClientError:
+        _record_email_delivery(recipient=email, subject=subject, success=True)
+    except (ClientError, SMTPException, OSError) as exc:
+        _record_email_delivery(recipient=email, subject=subject, success=False, error=exc)
         logger.exception("SES rejected welcome email for user %s", user_id)
+        raise
 
 
 @shared_task
+@track_celery_task("send_magic_link_email")
 def send_magic_link_email(token_id, raw_code=None):
     """Send a magic-link or OTP-code email for passwordless authentication.
 
@@ -77,13 +294,17 @@ def send_magic_link_email(token_id, raw_code=None):
     """
     magic_token = MagicLinkToken.objects.filter(id=token_id).first()
     if not magic_token:
+        _mark_task_skipped("Magic link token not found", {"token_id": str(token_id)})
         return
 
     email = magic_token.email.strip()
+    print(f"send_magic_link_email: token_id={token_id} email={email} delivery={magic_token.delivery}")  
+    
     try:
         validate_email(email)
     except ValidationError:
         logger.warning("Magic link skipped: invalid email format for token %s", token_id)
+        _mark_task_skipped("Invalid email format", {"token_id": str(token_id), "email": email})
         return
 
     if magic_token.delivery == "code":
@@ -92,6 +313,7 @@ def send_magic_link_email(token_id, raw_code=None):
                 "Magic link skipped: raw_code missing for code-delivery token %s",
                 token_id,
             )
+            _mark_task_skipped("Missing raw_code for code-delivery token", {"token_id": str(token_id)})
             return
         subject = f"Your BottleCRM sign-in code: {raw_code}"
         html_content = render_to_string(
@@ -100,6 +322,7 @@ def send_magic_link_email(token_id, raw_code=None):
         )
     else:
         magic_link_url = f"{settings.FRONTEND_URL}/login/verify?token={magic_token.token}"
+        print(f"Generated magic link URL: {magic_link_url}")
         subject = "Your BottleCRM sign-in link"
         html_content = render_to_string(
             "magic_link_email.html",
@@ -115,11 +338,15 @@ def send_magic_link_email(token_id, raw_code=None):
     msg.content_subtype = "html"
     try:
         msg.send()
-    except ClientError:
+        _record_email_delivery(recipient=email, subject=subject, success=True)
+    except (ClientError, SMTPException, OSError) as exc:
+        _record_email_delivery(recipient=email, subject=subject, success=False, error=exc)
         logger.exception("SES rejected email for magic link token %s", token_id)
+        raise
 
 
 @shared_task
+@track_celery_task("send_email_user_mentions")
 def send_email_user_mentions(
     comment_id,
     called_from,
@@ -186,10 +413,29 @@ def send_email_user_mentions(
                     to=recipients_list,
                 )
                 msg.content_subtype = "html"
-                msg.send()
+                try:
+                    msg.send()
+                    _record_email_delivery(
+                        recipient=recipient,
+                        subject=subject or "",
+                        success=True,
+                    )
+                except (ClientError, SMTPException, OSError) as exc:
+                    _record_email_delivery(
+                        recipient=recipient,
+                        subject=subject or "",
+                        success=False,
+                        error=exc,
+                    )
+                    raise
+        else:
+            _mark_task_skipped("No mention recipients found", {"comment_id": str(comment_id)})
+    else:
+        _mark_task_skipped("Comment not found", {"comment_id": str(comment_id)})
 
 
 @shared_task
+@track_celery_task("send_email_user_status")
 def send_email_user_status(
     user_id,
     status_changed_user="",
@@ -226,10 +472,29 @@ def send_email_user_status(
                 to=recipients,
             )
             msg.content_subtype = "html"
-            msg.send()
+            try:
+                msg.send()
+                _record_email_delivery(
+                    recipient=user.email,
+                    subject=subject,
+                    success=True,
+                )
+            except (ClientError, SMTPException, OSError) as exc:
+                _record_email_delivery(
+                    recipient=user.email,
+                    subject=subject,
+                    success=False,
+                    error=exc,
+                )
+                raise
+        else:
+            _mark_task_skipped("No recipients for status email", {"user_id": str(user_id)})
+    else:
+        _mark_task_skipped("User not found", {"user_id": str(user_id)})
 
 
 @shared_task
+@track_celery_task("send_email_user_delete")
 def send_email_user_delete(
     user_email,
     deleted_by="",
@@ -252,10 +517,29 @@ def send_email_user_delete(
                 to=recipients,
             )
             msg.content_subtype = "html"
-            msg.send()
+            try:
+                msg.send()
+                _record_email_delivery(
+                    recipient=user_email,
+                    subject=subject,
+                    success=True,
+                )
+            except (ClientError, SMTPException, OSError) as exc:
+                _record_email_delivery(
+                    recipient=user_email,
+                    subject=subject,
+                    success=False,
+                    error=exc,
+                )
+                raise
+        else:
+            _mark_task_skipped("No recipients for delete email", {"email": user_email})
+    else:
+        _mark_task_skipped("User email missing for delete notification")
 
 
 @shared_task
+@track_celery_task("remove_users")
 def remove_users(removed_users_list, team_id, org_id=None):
     # Set RLS context for org-scoped queries
     set_rls_context(org_id)
@@ -307,6 +591,7 @@ def remove_users(removed_users_list, team_id, org_id=None):
 
 
 @shared_task
+@track_celery_task("update_team_users")
 def update_team_users(team_id, org_id=None):
     """this function updates assigned_to field on all models when a team is updated"""
     # Set RLS context for org-scoped queries
@@ -379,6 +664,7 @@ NOTIFICATION_PURGE_DAYS = 90
 
 
 @shared_task
+@track_celery_task("purge_read_notifications")
 def purge_read_notifications(days=NOTIFICATION_PURGE_DAYS):
     """Delete already-read notifications older than ``days`` days.
 

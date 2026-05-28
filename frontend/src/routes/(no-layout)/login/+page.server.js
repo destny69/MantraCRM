@@ -99,7 +99,8 @@ async function handleOAuthCallback(code, returnedState, cookies) {
     throw redirect(307, '/login?error=session_expired');
   }
 
-  const redirect_uri = env.GOOGLE_LOGIN_DOMAIN + '/login';
+  const loginDomain = env.GOOGLE_LOGIN_DOMAIN || env.FRONTEND_URL || 'http://localhost:5173';
+  const redirect_uri = `${loginDomain.replace(/\/$/, '')}/login`;
 
   try {
     // Exchange code for tokens via Django backend
@@ -168,7 +169,8 @@ async function generateOAuthUrl(cookies) {
   cookies.set('oauth_state', state, getCookieOptions(oauthCookieMaxAge));
 
   // Build Google OAuth URL with all required parameters
-  const redirect_uri = env.GOOGLE_LOGIN_DOMAIN + '/login';
+  const loginDomain = env.GOOGLE_LOGIN_DOMAIN || env.FRONTEND_URL || 'http://localhost:5173';
+  const redirect_uri = `${loginDomain.replace(/\/$/, '')}/login`;
 
   const params = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID,

@@ -17,8 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install uv (fast Python package manager).
-COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
+# Install uv (fast Python package manager) without depending on GHCR.
+RUN python -m pip install --no-cache-dir uv==0.11.0
 
 # Install Python dependencies into /app/.venv (layer cached on lockfile changes)
 COPY backend/pyproject.toml backend/uv.lock backend/.python-version ./

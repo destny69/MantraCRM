@@ -1,6 +1,13 @@
 from django.contrib import admin
 
-from common.models import Address, Comment, CommentFiles, SessionToken, User
+from common.models import (
+    Address,
+    CeleryTaskLog,
+    Comment,
+    CommentFiles,
+    SessionToken,
+    User,
+)
 
 # Register your models here.
 
@@ -51,3 +58,35 @@ class SessionTokenAdmin(admin.ModelAdmin):
         self.message_user(request, f"{count} expired tokens cleaned up.")
 
     cleanup_expired.short_description = "Cleanup expired tokens"
+
+
+@admin.register(CeleryTaskLog)
+class CeleryTaskLogAdmin(admin.ModelAdmin):
+    list_display = (
+        "task_name",
+        "celery_task_id",
+        "status",
+        "email_status",
+        "email_sent_count",
+        "email_failed_count",
+        "started_at",
+        "finished_at",
+        "duration_ms",
+    )
+    list_filter = ("status", "email_status", "task_name", "started_at")
+    search_fields = ("task_name", "celery_task_id", "message")
+    readonly_fields = (
+        "id",
+        "task_name",
+        "celery_task_id",
+        "status",
+        "email_status",
+        "email_sent_count",
+        "email_failed_count",
+        "message",
+        "details",
+        "started_at",
+        "finished_at",
+        "duration_ms",
+    )
+    ordering = ("-started_at",)

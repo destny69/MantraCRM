@@ -30,7 +30,7 @@ AWS_IS_GZIPPED = True
 AWS_ENABLED = True
 AWS_S3_SECURE_URLS = True
 
-EMAIL_BACKEND = "django_ses.SESBackend"
+EMAIL_BACKEND = os.environ.get("EMAIL_BACKEND", "django_ses.SESBackend")
 
 SESSION_COOKIE_DOMAIN = ".bottlecrm.io"
 SESSION_COOKIE_SECURE = True  # Only send session cookie over HTTPS

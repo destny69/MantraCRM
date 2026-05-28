@@ -813,6 +813,61 @@ class ContactFormSubmission(BaseModel):
         return f"{self.name} - {self.email} ({self.reason})"
 
 
+class CeleryTaskLog(models.Model):
+    """Persistent execution log for Celery tasks and email delivery outcomes."""
+
+    class Status(models.TextChoices):
+        STARTED = "STARTED", "Started"
+        SUCCESS = "SUCCESS", "Success"
+        FAILED = "FAILED", "Failed"
+        SKIPPED = "SKIPPED", "Skipped"
+
+    class EmailStatus(models.TextChoices):
+        NONE = "NONE", "None"
+        SENT = "SENT", "Sent"
+        FAILED = "FAILED", "Failed"
+        PARTIAL = "PARTIAL", "Partial"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    task_name = models.CharField(max_length=255, db_index=True)
+    celery_task_id = models.CharField(max_length=255, blank=True, default="", db_index=True)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.STARTED,
+        db_index=True,
+    )
+
+    email_status = models.CharField(
+        max_length=16,
+        choices=EmailStatus.choices,
+        default=EmailStatus.NONE,
+    )
+    email_sent_count = models.PositiveIntegerField(default=0)
+    email_failed_count = models.PositiveIntegerField(default=0)
+
+    message = models.TextField(blank=True, default="")
+    details = models.JSONField(default=dict, blank=True)
+
+    started_at = models.DateTimeField(auto_now_add=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    duration_ms = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        verbose_name = "Celery Task Log"
+        verbose_name_plural = "Celery Task Logs"
+        db_table = "celery_task_log"
+        ordering = ["-started_at"]
+        indexes = [
+            models.Index(fields=["task_name", "status"]),
+            models.Index(fields=["celery_task_id"]),
+            models.Index(fields=["-started_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.task_name} [{self.status}]"
+
+
 class CustomFieldDefinition(BaseModel):
     """Per-org schema extension for any supported entity (Case, Lead, ...).
 
